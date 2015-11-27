@@ -92,10 +92,16 @@
 
 #include "networktransport-impl.h"
 
-typedef Network::Transport< Terminal::Complete, Network::UserStream > ServerConnection;
+#ifndef __clang__
+/* centos 6 / gcc4.4 hack */
+#undef PRIu64
+#define PRIu64 "lu"
+#endif
+
+typedef Network::Transport< Network::UserStream, Network::UserStream > ServerConnection;
 
 static void serve( int host_fd,
-		   Terminal::Complete &terminal,
+		   Network::UserStream &terminal,
 		   ServerConnection &network,
 		   long network_timeout,
 		   long network_signaled_timeout );
@@ -407,8 +413,7 @@ static int run_server( const char *desired_ip, const char *desired_port,
     window_size.ws_row = 24;
   }
 
-  /* open parser and terminal */
-  Terminal::Complete terminal( window_size.ws_col, window_size.ws_row );
+  Network::UserStream terminal;
 
   /* open network */
   Network::UserStream blank;
@@ -553,7 +558,7 @@ static int run_server( const char *desired_ip, const char *desired_port,
 
     chdir_homedir();
 
-    if ( with_motd && (!motd_hushed()) ) {
+    if ( 0 && with_motd && (!motd_hushed()) ) {
       // On illumos motd is printed by /etc/profile.
 #ifndef __sun
       // For Ubuntu, try and print one of {,/var}/run/motd.dynamic.
@@ -628,7 +633,7 @@ static int run_server( const char *desired_ip, const char *desired_port,
   return 0;
 }
 
-static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &network, long network_timeout, long network_signaled_timeout )
+static void serve( int host_fd, Network::UserStream &terminal, ServerConnection &network, long network_timeout, long network_signaled_timeout )
 {
   /* scale timeouts */
   const uint64_t network_timeout_ms = static_cast<uint64_t>( network_timeout ) * 1000;
@@ -657,7 +662,6 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
       uint64_t now = Network::timestamp();
 
       timeout = min( timeout, network.wait_time() );
-      timeout = min( timeout, terminal.wait_time( now ) );
       if ( (!network.get_remote_state_num())
 	   || network.shutdown_in_progress() ) {
         timeout = min( timeout, 5000 );
@@ -706,7 +710,8 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
 	if ( network.get_remote_state_num() != last_remote_num ) {
 	  last_remote_num = network.get_remote_state_num();
 
-	  
+	  string terminal_to_host;
+
 	  Network::UserStream us;
 	  us.apply_string( network.get_remote_diff() );
 	  /* apply userstream to terminal */
@@ -731,20 +736,17 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
 		perror( "ioctl TIOCSWINSZ" );
 		network.start_shutdown();
 	      }
-	    }
-	    terminal_to_host += terminal.act( action );
+            } else {
+	      assert(typeid( *action ) == typeid( Parser::UserByte ));
+	      terminal_to_host += ((Parser::UserByte *)action)->c;
+            }
 	  }
 
-	  if ( !us.empty() ) {
-	    /* register input frame number for future echo ack */
-	    terminal.register_input_frame( last_remote_num, now );
+	  /* write any writeback octets back to the host */
+	  if ( swrite( host_fd, terminal_to_host.c_str(), terminal_to_host.length() ) < 0 ) {
+	    break;
 	  }
 
-	  /* update client with new state of terminal */
-	  if ( !network.shutdown_in_progress() ) {
-	    network.set_current_state( terminal );
-	  }
-	  
 	  #ifdef HAVE_UTEMPTER
 	  /* update utmp entry if we have become "connected" */
 	  if ( (!connected_utmp)
@@ -796,10 +798,8 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
         if ( bytes_read <= 0 ) {
 	  network.start_shutdown();
 	} else {
-	  terminal_to_host += terminal.act( string( buf, bytes_read ) );
-	
-	  /* update client with new state of terminal */
-	  network.set_current_state( terminal );
+	  for (int i = 0; i < bytes_read; i++)
+            network.get_current_state().push_back( Parser::UserByte( buf[i] ) );
 	}
       }
 
@@ -831,7 +831,17 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
 	  break;
 	}
       }
-      
+
+      //if ( sel.error( network_fd ) ) {
+      //  /* network problem */
+      //  break;
+      //}
+
+      //if ( (!network.shutdown_in_progress()) && sel.error( host_fd ) ) {
+      //  /* host problem */
+      //  network.start_shutdown();
+      //}
+
       /* quit if our shutdown has been acknowledged */
       if ( network.shutdown_in_progress() && network.shutdown_acknowledged() ) {
 	break;
@@ -861,13 +871,6 @@ static void serve( int host_fd, Terminal::Complete &terminal, ServerConnection &
 	}
       }
       #endif
-
-      if ( terminal.set_echo_ack( now ) ) {
-	/* update client with new echo ack */
-	if ( !network.shutdown_in_progress() ) {
-	  network.set_current_state( terminal );
-	}
-      }
 
       if ( !network.get_remote_state_num()
            && time_since_remote_state >= timeout_if_no_client ) {
